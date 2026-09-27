@@ -35,6 +35,13 @@ If you are using Claude Code, Codex, or Cursor, you can provide them with the fo
 ## How it Works
 
 The CLI automates the entire SSH printing process into a single command:
-1. `scp` - Uploads the PDF securely to the SoC server's `/tmp` directory.
-2. `ssh` - Remotely executes `lpr -P<queue> /tmp/...` to push the document directly into the printing queue.
-3. Automatically deletes the temporary remote PDF footprint once spooled.
+
+1. **`scp`**: Uploads the PDF securely to the SoC server's `/tmp` directory.
+   ```bash
+   scp filename.pdf username@stu.comp.nus.edu.sg:/tmp/socprint_123.pdf
+   ```
+
+2. **`ssh lpr`**: Remotely executes the print spool command and immediately cleans up the payload.
+   ```bash
+   ssh username@stu.comp.nus.edu.sg 'lpr -P<queue> /tmp/socprint_123.pdf && lpq -P<queue> ; rm -f /tmp/socprint_123.pdf'
+   ```
