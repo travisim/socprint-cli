@@ -3,8 +3,8 @@
 import os
 import sys
 import json
+import re
 import shlex
-import getpass
 import tempfile
 import subprocess
 import time
@@ -61,24 +61,46 @@ console = Console(theme=custom_theme)
 
 CONFIG_DIR = os.path.expanduser("~/.config/socprint")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+KNOWN_HOSTS = os.path.join(CONFIG_DIR, "known_hosts")
+KEY_PATH = os.path.expanduser("~/.ssh/socprint_ed25519")
+SSH_HOST = "stu.comp.nus.edu.sg"
+USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
+
+# Host key is checked against a known_hosts file that only this tool uses,
+# and only the dedicated socprint key is offered to the server.
+SSH_OPTS = [
+    "-i", KEY_PATH,
+    "-o", "IdentitiesOnly=yes",
+    "-o", "StrictHostKeyChecking=yes",
+    "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+]
 
 def load_config():
+    """Load the saved username. Legacy configs that stored a password are scrubbed."""
     if not os.path.exists(CONFIG_FILE):
         return None
     try:
         with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
+            cfg = json.load(f)
     except Exception:
         return None
+    if "password" in cfg:
+        save_config(cfg.get("username"))
+        cfg = {"username": cfg.get("username")}
+    return cfg
 
-def save_config(username, password):
+def save_config(username):
+    """Persist the username only. No password is ever written to disk."""
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(CONFIG_FILE, 'w') as f:
-        json.dump({"username": username, "password": password}, f)
+        json.dump({"username": username}, f)
     os.chmod(CONFIG_FILE, 0o600)
 
+def valid_username(name):
+    return bool(USERNAME_RE.match(name))
+
 def run_command(cmd, text, timeout=30):
-    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     idx = 0
     with Live(refresh_per_second=10, console=console) as live:
         while process.poll() is None:
@@ -100,101 +122,116 @@ def run_command(cmd, text, timeout=30):
             
     return CommandResult(process.returncode, out.decode('utf-8', 'ignore'), err.decode('utf-8', 'ignore'))
 
-def verify_credentials(username, password):
-    ssh_user = username.split('@')[0]
-    ssh_host = "stu.comp.nus.edu.sg"
-    
-    expect_script = f"""
-log_user 0
-set timeout 15
-spawn ssh -o StrictHostKeyChecking=no {ssh_user}@{ssh_host} "echo VERIFIED"
-expect {{
-    "assword:" {{
-        send "$env(SSH_PASS)\\r"
-        expect {{
-            "VERIFIED" {{ exit 0 }}
-            "denied" {{ exit 1 }}
-            "Permission denied" {{ exit 1 }}
-            timeout {{ exit 2 }}
-        }}
-    }}
-    "VERIFIED" {{ exit 0 }}
-    timeout {{ exit 2 }}
-}}
-"""
-    env = os.environ.copy()
-    env["SSH_PASS"] = password
-    process = subprocess.Popen(['/usr/bin/expect', '-c', expect_script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-    
-    idx = 0
-    console.print()
-    with Live(refresh_per_second=10, console=console) as live:
-        while process.poll() is None:
-            cat = CAT_FRAMES[idx % len(CAT_FRAMES)]
-            table = Table.grid(expand=True)
-            table.add_column("Text", justify="left", ratio=1, vertical="middle")
-            table.add_column("Donut", justify="left", vertical="middle")
-            table.add_row(f"[bold cyan]Verifying credentials...[/]", Text(cat, style="yellow", justify="left"))
-            live.update(Panel(table, border_style="cyan", padding=(1, 2)))
-            idx += 1
-            time.sleep(0.1)
-            
-    return process.returncode == 0
+def trust_host_key():
+    """Show the server's SSH host-key fingerprint and let the user confirm it (once)."""
+    if os.path.exists(KNOWN_HOSTS) and os.path.getsize(KNOWN_HOSTS) > 0:
+        return True
+    scan = subprocess.run(["ssh-keyscan", "-t", "ed25519", SSH_HOST], capture_output=True, text=True, timeout=20)
+    if scan.returncode != 0 or not scan.stdout.strip():
+        console.print("[danger]Could not fetch the SSH host key. Are you on the SoC VPN / network?[/danger]")
+        return False
+    fp = subprocess.run(["ssh-keygen", "-lf", "-"], input=scan.stdout, capture_output=True, text=True)
+    console.print(Panel(
+        f"Server: [bold]{SSH_HOST}[/bold]\n{fp.stdout.strip()}\n\n"
+        "Confirm this fingerprint matches the one published by SoC IT before continuing.\n"
+        "If you cannot verify it, answer [bold]n[/bold].",
+        title="[bold yellow]Verify SSH host key[/bold yellow]", border_style="yellow", padding=(1, 2)))
+    if not Confirm.ask("Trust this host key?", default=False):
+        return False
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(KNOWN_HOSTS, "w") as f:
+        f.write(scan.stdout)
+    os.chmod(KNOWN_HOSTS, 0o600)
+    return True
+
+def ensure_key():
+    """Create a dedicated key so the user's own SSH keys are never touched."""
+    if os.path.exists(KEY_PATH):
+        return True
+    os.makedirs(os.path.dirname(KEY_PATH), mode=0o700, exist_ok=True)
+    r = subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "socprint-cli", "-f", KEY_PATH],
+                       capture_output=True, text=True)
+    return r.returncode == 0
+
+def key_login_works(ssh_user):
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", *SSH_OPTS, f"{ssh_user}@{SSH_HOST}", "echo VERIFIED"],
+                       capture_output=True, text=True, timeout=30)
+    return r.returncode == 0 and "VERIFIED" in r.stdout
+
+def install_key(ssh_user):
+    """Append the public key to the server. ssh itself prompts for the password in the
+    terminal; this program never sees, receives or stores it."""
+    with open(KEY_PATH + ".pub") as f:
+        pub = f.read()
+    r = subprocess.run(
+        ["ssh", "-i", KEY_PATH, "-o", "IdentitiesOnly=no", "-o", "PubkeyAuthentication=no",
+         "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+         f"{ssh_user}@{SSH_HOST}",
+         "umask 077; mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"],
+        input=pub, text=True)
+    return r.returncode == 0
 
 def setup_wizard():
     while True:
         console.clear()
         username = get_input_animated(
-            prompt_prefix="[bold blue]❯[/bold blue] [bold]SoC Email / Username:[/bold]",
-            title="[bold magenta]Welcome to SoC Print CLI[/bold magenta]",
-            subtitle="[dim]Please enter your NUS SoC credentials to continue.[/dim]\n[dim](e.g. username@stu.comp.nus.edu.sg)[/dim]"
-        ).strip()
-        
+            prompt_prefix="[bold blue]❯[/bold blue] [bold]SoC Username:[/bold]",
+            title="[bold magenta]Welcome to SoC Print CLI (unofficial)[/bold magenta]",
+            subtitle="[dim]Unofficial community tool, not endorsed by NUS SoC IT.[/dim]\n[dim](e.g. username or username@stu.comp.nus.edu.sg)[/dim]"
+        ).strip().lower()
+
         if not username:
             console.print("[danger]Username cannot be empty.[/danger]")
             time.sleep(1.5)
             continue
-            
-        if "@" in username and not username.endswith("@stu.comp.nus.edu.sg"):
-            console.print("[danger]Please use your @stu.comp.nus.edu.sg email, or just enter your username.[/danger]")
+
+        if "@" in username:
+            if not username.endswith("@stu.comp.nus.edu.sg"):
+                console.print("[danger]Please use your @stu.comp.nus.edu.sg email, or just enter your username.[/danger]")
+                time.sleep(1.5)
+                continue
+            username = username.split("@")[0]
+
+        if not valid_username(username):
+            console.print("[danger]Invalid username (letters, digits, '.', '_' and '-' only).[/danger]")
             time.sleep(1.5)
             continue
-            
         break
-    
+
     console.clear()
-    password = get_input_animated(
-        prompt_prefix="[bold blue]❯[/bold blue] [bold]Password:[/bold]",
-        title="[bold magenta]Welcome to SoC Print CLI[/bold magenta]",
-        subtitle="[dim]Please enter your NUS SoC credentials to continue.[/dim]",
-        is_password=True
-    )
-    
-    if not password:
-        console.print("[danger]Password cannot be empty.[/danger]")
+    console.print(Panel(
+        "This tool will:\n"
+        f"  1. Create a dedicated SSH key at [cyan]{KEY_PATH}[/cyan]\n"
+        f"  2. Add its [bold]public[/bold] key to [cyan]~/.ssh/authorized_keys[/cyan] on {SSH_HOST}\n"
+        "  3. Add a [cyan]socprinter[/cyan] alias to your shell config\n\n"
+        "Your password is typed into ssh directly, once. It is never read, stored or sent anywhere by this tool.\n"
+        "Nothing is sent to any website or analytics service.",
+        title="[bold yellow]Before we begin[/bold yellow]", border_style="yellow", padding=(1, 2)))
+    if not Confirm.ask("Continue?", default=False):
+        console.print("[warning]Setup cancelled.[/warning]")
+        sys.exit(0)
+
+    if not trust_host_key():
+        console.print("[danger]Host key not trusted. Aborting.[/danger]")
         sys.exit(1)
-        
-    console.clear()
-    if not verify_credentials(username, password):
-        console.print("[danger]Authentication failed! Please check your username and password.[/danger]")
-        time.sleep(2)
+    if not ensure_key():
+        console.print("[danger]Could not create SSH key (is ssh-keygen installed?).[/danger]")
         sys.exit(1)
-        
-    save_config(username, password)
-    console.print("[success]✔ Credentials verified and securely saved.[/success]\n")
-    
+
+    if not key_login_works(username):
+        console.print(f"[info]Enter your SoC password when ssh asks (it goes straight to ssh).[/info]")
+        if not install_key(username) or not key_login_works(username):
+            console.print("[danger]Authentication failed! Please check your username and password.[/danger]")
+            time.sleep(2)
+            sys.exit(1)
+
+    save_config(username)
+    console.print("[success]✔ SSH key installed. No password was stored.[/success]\n")
+
     with console.status("[cyan]Configuring environment...[/cyan]", spinner="dots"):
-        ssh_user = username.split('@')[0]
-        ssh_host = "stu.comp.nus.edu.sg"
         script_path = os.path.abspath(__file__)
-        
+
         if sys.platform == "win32":
-            pub_key = os.path.expanduser("~/.ssh/id_rsa.pub")
-            if not os.path.exists(pub_key): pub_key = os.path.expanduser("~/.ssh/id_ed25519.pub")
-            if os.path.exists(pub_key):
-                with open(pub_key, "r") as f: key_data = f.read().strip()
-                os.system(f'ssh {ssh_user}@{ssh_host} "mkdir -p ~/.ssh && echo {key_data} >> ~/.ssh/authorized_keys"')
-            
             ps_profile_dir = os.path.expanduser("~/Documents/WindowsPowerShell")
             os.makedirs(ps_profile_dir, exist_ok=True)
             ps_profile = os.path.join(ps_profile_dir, "Microsoft.PowerShell_profile.ps1")
@@ -203,21 +240,14 @@ def setup_wizard():
             except FileNotFoundError: content = ""
             if "function socprinter" not in content:
                 with open(ps_profile, "a") as f: f.write(f"\nfunction socprinter {{ python '{script_path}' }}\n")
-            
+
             try:
                 wrapper = os.path.join(os.path.dirname(script_path), "socprinter.bat")
                 with open(wrapper, "w") as f: f.write(f'@echo off\npython "{script_path}" %*')
             except Exception: pass
         else:
-            os.system(f"ssh-copy-id {ssh_user}@{ssh_host} >/dev/null 2>&1")
-            
-            shells = [
-                ("~/.zshrc", f'\nalias socprinter="python3 {script_path}"\n'),
-                ("~/.bashrc", f'\nalias socprinter="python3 {script_path}"\n'),
-                ("~/.bash_profile", f'\nalias socprinter="python3 {script_path}"\n'),
-                ("~/.config/fish/config.fish", f'\nalias socprinter="python3 {script_path}"\n')
-            ]
-            for shell_file, alias_str in shells:
+            alias_str = f'\nalias socprinter="python3 {shlex.quote(script_path)}"\n'
+            for shell_file in ["~/.zshrc", "~/.bashrc", "~/.bash_profile", "~/.config/fish/config.fish"]:
                 path = os.path.expanduser(shell_file)
                 if os.path.exists(path):
                     try:
@@ -225,18 +255,19 @@ def setup_wizard():
                         if "socprinter=" not in content:
                             with open(path, "a") as f: f.write(alias_str)
                     except Exception: pass
-        
+
     console.print(Panel(
         "✔ Installed [bold cyan]socprinter[/bold cyan] terminal alias / wrapper script\n"
-        "✔ Configured SSH keys for passwordless printing to SoC queues\n\n"
-        "You can now simply type [bold]socprinter[/bold] from any folder to launch this app.",
+        "✔ Configured a dedicated SSH key for passwordless printing to SoC queues\n\n"
+        "You can now simply type [bold]socprinter[/bold] from any folder to launch this app.\n"
+        "To remove access: run [bold]socprinter uninstall[/bold].",
         title="[bold green]System Integration Complete[/bold green]",
         border_style="green",
         padding=(1, 2)
     ))
     time.sleep(3.5)
-    
-    return username, password
+
+    return username
 
 def get_printer_selection():
     console.print(Panel(
@@ -352,28 +383,45 @@ def get_input_animated(prompt_prefix, title, subtitle, is_password=False):
     ))
     return final_str
 
+def uninstall():
+    """Remove the local key, host-key file and settings, and revoke the key on the server."""
+    pub = ""
+    try:
+        with open(KEY_PATH + ".pub") as f: pub = f.read().strip()
+    except Exception: pass
+    cfg = None
+    try:
+        with open(CONFIG_FILE) as f: cfg = json.load(f)
+    except Exception: pass
+    user = (cfg or {}).get("username")
+    if pub and user and valid_username(user):
+        key_body = pub.split()[1] if len(pub.split()) > 1 else ""
+        if key_body.isalnum() or all(c.isalnum() or c in "+/=" for c in key_body):
+            subprocess.run(["ssh", "-o", "BatchMode=yes", *SSH_OPTS, f"{user}@{SSH_HOST}",
+                            f"grep -vF {shlex.quote(key_body)} ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp; "
+                            "mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys"],
+                           capture_output=True)
+    for p in (CONFIG_FILE, KNOWN_HOSTS, KEY_PATH, KEY_PATH + ".pub"):
+        try: os.remove(p)
+        except OSError: pass
+    console.clear()
+    console.print("[success]Removed local key, settings and the key on the SoC server. Remove the 'socprinter' alias from your shell config manually if desired.[/success]")
+
 def main():
     cfg = load_config()
-    if not cfg:
-        username, password = setup_wizard()
-    else:
-        username = cfg.get("username")
-        password = cfg.get("password")
-        if not username or not password:
-            username, password = setup_wizard()
-    
-    ssh_host = "stu.comp.nus.edu.sg"
-    ssh_user = username.split('@')[0]
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ('reset', 'uninstall'):
+        uninstall()
+        return
+
+    username = cfg.get("username") if cfg else None
+    if not username or not valid_username(username) or not os.path.exists(KEY_PATH):
+        username = setup_wizard()
+
+    ssh_host = SSH_HOST
+    ssh_user = username
     
     auto = False
     if len(sys.argv) > 1:
-        if sys.argv[1].lower() == 'reset':
-            try: os.remove(CONFIG_FILE)
-            except: pass
-            console.clear()
-            console.print("[success]Signed out successfully. Run 'socprinter' again to log in.[/success]")
-            return
-        
         auto = "--auto" in sys.argv
         paths_input = " ".join(shlex.quote(f) for f in sys.argv[1:] if f != "--auto")
     else:
@@ -383,15 +431,12 @@ def main():
         paths_input = get_input_animated(
             prompt_prefix="[bold blue]❯[/bold blue] [bold]Drag and drop PDF file(s) here:[/bold]",
             title="[bold blue]SoC Print Manager[/bold blue]",
-            subtitle=f"[dim]Logged in as [bold]{username}[/bold] — type 'reset' to sign out[/dim]\n[dim]AI Agents: run [cyan]socprinter <file> --auto[/cyan] to print silently[/dim]"
+            subtitle=f"[dim]Logged in as [bold]{username}[/bold] — type 'uninstall' to remove local key and settings[/dim]\n[dim]AI Agents: run [cyan]socprinter <file> --auto[/cyan] to print silently[/dim]"
         ).strip()
         console.print()
         
-        if paths_input.lower() == 'reset':
-            try: os.remove(CONFIG_FILE)
-            except: pass
-            console.clear()
-            console.print("[success]Signed out successfully. Run 'socprinter' again to log in.[/success]")
+        if paths_input.lower() in ('reset', 'uninstall'):
+            uninstall()
             return
         
     if not paths_input:
@@ -455,7 +500,7 @@ def main():
         
     remote_pdf = f"/tmp/socprint_{timestamp}.pdf"
     
-    scp_cmd = f"scp -q {shlex.quote(pdf_to_send)} {ssh_user}@{ssh_host}:{remote_pdf}"
+    scp_cmd = ["scp", "-q", "-o", "BatchMode=yes", *SSH_OPTS, pdf_to_send, f"{ssh_user}@{ssh_host}:{remote_pdf}"]
     res = run_command(scp_cmd, f"Uploading to {ssh_host}")
     
     if res and res.returncode != 0:
@@ -463,7 +508,8 @@ def main():
         if final_pdf: os.remove(final_pdf)
         return
             
-    lpr_cmd = f"ssh {ssh_user}@{ssh_host} 'lpr -P{printer} {remote_pdf} && lpq -P{printer} ; rm -f {remote_pdf}'"
+    lpr_cmd = ["ssh", "-o", "BatchMode=yes", *SSH_OPTS, f"{ssh_user}@{ssh_host}",
+               f"lpr -P{shlex.quote(printer)} {remote_pdf} && lpq -P{shlex.quote(printer)} ; rm -f {remote_pdf}"]
     res = run_command(lpr_cmd, f"Submitting to queue '{printer}'")
         
     # STEP 4: Success Screen
