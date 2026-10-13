@@ -133,8 +133,8 @@ def trust_host_key():
     fp = subprocess.run(["ssh-keygen", "-lf", "-"], input=scan.stdout, capture_output=True, text=True)
     console.print(Panel(
         f"Server: [bold]{SSH_HOST}[/bold]\n{fp.stdout.strip()}\n\n"
-        "Confirm this fingerprint matches the one published by SoC IT before continuing.\n"
-        "If you cannot verify it, answer [bold]n[/bold].",
+        "This tool cannot verify the fingerprint for you. Confirm it with SoC IT (official SoC documentation or\n"
+        "SoC IT support) before continuing. If you cannot verify it, answer [bold]n[/bold].",
         title="[bold yellow]Verify SSH host key[/bold yellow]", border_style="yellow", padding=(1, 2)))
     if not Confirm.ask("Trust this host key?", default=False):
         return False

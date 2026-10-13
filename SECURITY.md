@@ -9,5 +9,8 @@ SoC Print CLI is an **unofficial** community tool. It is not endorsed or approve
 - Makes no network connections other than SSH/SCP to `stu.comp.nus.edu.sg`. No telemetry.
 - Stores only your username in `~/.config/socprint/config.json` (mode 600).
 
+## Notice for users of earlier versions
+Earlier versions stored the SoC password in plaintext in `~/.config/socprint/config.json` and disabled host-key checking. If you installed one, remove it and its stored credentials (see the README upgrade notice), change your SoC password as a precaution, and install the current version. The tool has no update channel or telemetry, so it cannot notify you itself.
+
 ## Reporting a vulnerability
 Open a private security advisory on this repository, or email the maintainer. Please allow reasonable time for a fix.
